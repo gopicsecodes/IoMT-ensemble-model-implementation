@@ -1,0 +1,298 @@
+# ============================================================
+# ToN-IoT dataset
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, RandomizedSearchCV
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    confusion_matrix
+)
+from xgboost import XGBClassifier
+
+
+DATA_FILE = "/content/train_test_network.csv"  
+
+
+def load_and_clean_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CSV not found: {path}")
+    df = pd.read_csv(path, low_memory=False)
+    df.columns = [c.strip() for c in df.columns]
+    df.replace([np.inf, -np.inf, "Infinity", "inf", "Inf"], np.nan, inplace=True)
+    df.dropna(axis=0, inplace=True)
+    df.drop_duplicates(inplace=True)
+    return df
+
+
+def make_binary_y(df: pd.DataFrame):
+    cols = df.columns
+
+    if "Attack" in cols:
+        s = df["Attack"]
+        if pd.api.types.is_numeric_dtype(s):
+            y = s.astype(int).values
+        else:
+            s2 = s.astype(str).str.strip().str.lower()
+            y = np.where(s2.isin(["0", "benign", "normal", "false", "no"]), 0, 1).astype(int)
+        return y, ["Attack"]
+
+    if "type" in cols:
+        s2 = df["type"].astype(str).str.strip().str.lower()
+        y = (s2 != "normal").astype(int).values
+        return y, ["type"]
+
+    for c in ["Label", "label", "attack", "is_attack", "class", "Class"]:
+        if c in cols:
+            s = df[c]
+            if pd.api.types.is_numeric_dtype(s):
+                y = s.astype(int).values
+            else:
+                s2 = s.astype(str).str.strip().str.lower()
+                y = np.where(s2.isin(["benign", "normal", "0", "false", "no"]), 0, 1).astype(int)
+            return y, [c]
+
+    raise ValueError("No usable label column found (expected Attack/type/Label).")
+
+def ensure_two_classes(y):
+    uniq, cnt = np.unique(y, return_counts=True)
+    dist = dict(zip(uniq.tolist(), cnt.tolist()))
+    print("Label distribution:", dist)
+    if len(uniq) < 2:
+        raise ValueError("Only ONE class present in this file.")
+
+
+def build_leak_safe_X(df: pd.DataFrame, label_cols: list):
+    X = df.drop(columns=label_cols, errors="ignore")
+
+    # Drop obvious leakage names + identifiers
+    leak_keywords = ["attack", "label", "class", "target", "category", "type"]
+    id_keywords = [
+        "timestamp","time","date","ts","uid","uuid","flow","session","conn",
+        "srcip","dstip","src_ip","dst_ip","ip","srcport","dstport","src_port","dst_port","port",
+        "mac","imei","imsi"
+    ]
+
+    leak_cols = [c for c in X.columns if any(k in c.lower() for k in leak_keywords)]
+    id_cols   = [c for c in X.columns if any(k in c.lower() for k in id_keywords)]
+    X = X.drop(columns=list(set(leak_cols + id_cols)), errors="ignore")
+
+    # Drop hi-card text
+    obj_cols = X.select_dtypes(include=["object"]).columns.tolist()
+    hi_card = [c for c in obj_cols if X[c].nunique(dropna=True) > 200]
+    X = X.drop(columns=hi_card, errors="ignore")
+
+    # Coerce numeric-like text
+    for c in X.columns:
+        if X[c].dtype == "object":
+            X[c] = pd.to_numeric(X[c], errors="ignore")
+
+    return X
+
+
+def make_preprocessor(X_df: pd.DataFrame):
+    cat_cols = X_df.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+    num_cols = [c for c in X_df.columns if c not in cat_cols]
+    return ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), num_cols),
+            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+        ],
+        remainder="drop"
+    )
+
+def scale_pos_weight(y):
+    neg = np.sum(y == 0)
+    pos = np.sum(y == 1)
+    return float(neg / pos) if pos > 0 else 1.0
+
+
+def best_threshold(y_true, prob, metric="accuracy"):
+    ths = np.linspace(0.01, 0.99, 199)
+    best = (-1, 0.5)
+    for t in ths:
+        pred = (prob >= t).astype(int)
+        if metric == "accuracy":
+            s = accuracy_score(y_true, pred)
+        elif metric == "f1":
+            s = f1_score(y_true, pred, zero_division=0)
+        else:
+            s = accuracy_score(y_true, pred)
+        if s > best[0]:
+            best = (s, t)
+    return best  # (score, threshold)
+
+def print_metrics(name, y_true, pred, prob):
+    print(f"\n{name}")
+    print(f"Accuracy  : {accuracy_score(y_true, pred)*100:.2f}%")
+    print(f"Precision : {precision_score(y_true, pred, zero_division=0)*100:.2f}%")
+    print(f"Recall    : {recall_score(y_true, pred, zero_division=0)*100:.2f}%")
+    print(f"F1-score  : {f1_score(y_true, pred, zero_division=0)*100:.2f}%")
+    print(f"AUC-ROC   : {roc_auc_score(y_true, prob)*100:.2f}%")
+
+
+df = load_and_clean_csv(DATA_FILE)
+y, label_cols = make_binary_y(df)
+ensure_two_classes(y)
+
+X = build_leak_safe_X(df, label_cols)
+print("Final X shape:", X.shape)
+
+# Splits
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+X_tr_sub, X_val, y_tr_sub, y_val = train_test_split(X_tr, y_tr, test_size=0.2, stratify=y_tr, random_state=42)
+
+spw = scale_pos_weight(y_tr_sub)
+
+
+xgb_pipe = Pipeline([
+    ("prep", make_preprocessor(X_tr_sub)),
+    ("clf", XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="auc",
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=42,
+        scale_pos_weight=spw
+    ))
+])
+
+param_space = {
+    "clf__n_estimators": [600, 900, 1200, 1600],
+    "clf__max_depth": [4, 6, 8, 10, 12],
+    "clf__learning_rate": [0.01, 0.02, 0.03, 0.05],
+    "clf__subsample": [0.7, 0.85, 1.0],
+    "clf__colsample_bytree": [0.7, 0.85, 1.0],
+    "clf__min_child_weight": [1, 2, 3, 5, 8],
+    "clf__gamma": [0, 0.5, 1, 2, 5],
+    "clf__reg_alpha": [0.0, 0.1, 1.0],
+    "clf__reg_lambda": [1, 3, 10, 20],
+}
+
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+rs = RandomizedSearchCV(
+    xgb_pipe,
+    param_distributions=param_space,
+    n_iter=18,                 # increase to 30 if you can
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=-1,
+    verbose=1,
+    random_state=42,
+    error_score="raise"
+)
+
+print("\nTuning XGBoost...")
+rs.fit(X_tr_sub, y_tr_sub)
+best_xgb = rs.best_estimator_
+print("Best XGB params:", rs.best_params_)
+print("Best CV AUC:", rs.best_score_)
+
+# ============================================================
+# 2) Calibrated SVM (probabilities become meaningful → helps ensemble AUC)
+# ============================================================
+# train SVM on a subsample for speed
+SVM_SAMPLES = min(80000, len(X_tr_sub))
+X_svm, _, y_svm, _ = train_test_split(X_tr_sub, y_tr_sub, train_size=SVM_SAMPLES, stratify=y_tr_sub, random_state=42)
+
+svm_base = Pipeline([
+    ("prep", make_preprocessor(X_svm)),
+    ("clf", SVC(kernel="rbf", C=8, gamma="scale", class_weight="balanced"))  # probability=False here
+])
+
+# Calibrate with sigmoid (Platt scaling)
+svm_cal = CalibratedClassifierCV(svm_base, method="sigmoid", cv=3)
+print("\nTraining calibrated SVM...")
+svm_cal.fit(X_svm, y_svm)
+
+# ============================================================
+# 3) Validate: tune ensemble weight + threshold finely
+# ============================================================
+px = best_xgb.predict_proba(X_val)[:, 1]
+ps = svm_cal.predict_proba(X_val)[:, 1]
+
+best_cfg = None
+best_acc = -1.0
+
+
+for wx in np.linspace(0.70, 0.98, 29):     # finer than before
+    p_ens = wx*px + (1-wx)*ps
+    acc, thr = best_threshold(y_val, p_ens, metric="accuracy")
+    if acc > best_acc:
+        best_acc = acc
+        best_cfg = (float(wx), float(thr))
+
+print("\nBest VAL ensemble (wx, thr):", best_cfg, "VAL Accuracy:", best_acc)
+
+# Optional: best F1 threshold too (just to inspect)
+f1s, thr_f1 = best_threshold(y_val, (best_cfg[0]*px + (1-best_cfg[0])*ps), metric="f1")
+print("Best VAL F1 threshold:", thr_f1, "VAL F1:", f1s)
+
+# ============================================================
+# 4) Final fit on full train, then test evaluation
+# ============================================================
+spw_full = scale_pos_weight(y_tr)
+
+xgb_final = Pipeline([
+    ("prep", make_preprocessor(X_tr)),
+    ("clf", XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="auc",
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=42,
+        scale_pos_weight=spw_full,
+        **rs.best_params_["clf"] if isinstance(rs.best_params_.get("clf"), dict) else {}
+    ))
+])
+
+# safer: reuse best params explicitly
+best_params = rs.best_params_
+xgb_final = Pipeline([
+    ("prep", make_preprocessor(X_tr)),
+    ("clf", XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="auc",
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=42,
+        scale_pos_weight=spw_full,
+        n_estimators=best_params.get("clf__n_estimators", 900),
+        max_depth=best_params.get("clf__max_depth", 8),
+        learning_rate=best_params.get("clf__learning_rate", 0.03),
+        subsample=best_params.get("clf__subsample", 0.85),
+        colsample_bytree=best_params.get("clf__colsample_bytree", 0.85),
+        min_child_weight=best_params.get("clf__min_child_weight", 2),
+        gamma=best_params.get("clf__gamma", 0),
+        reg_alpha=best_params.get("clf__reg_alpha", 0.0),
+        reg_lambda=best_params.get("clf__reg_lambda", 3),
+    ))
+])
+
+print("\nFinal training XGB...")
+xgb_final.fit(X_tr, y_tr)
+
+print("Final training SVM calibration model (subsampled)...")
+svm_cal.fit(X_svm, y_svm)  # keep as-is for feasibility
+
+
+px_te = xgb_final.predict_proba(X_te)[:, 1]
+ps_te = svm_cal.predict_proba(X_te)[:, 1]
+
+wx, thr = best_cfg
+p_ens_te = wx*px_te + (1-wx)*ps_te
+pred_ens = (p_ens_te >= thr).astype(int)
+
+print_metrics("Ensemble (Test)", y_te, pred_ens, p_ens_te)
+print("\nConfusion Matrix:\n", confusion_matrix(y_te, pred_ens))
