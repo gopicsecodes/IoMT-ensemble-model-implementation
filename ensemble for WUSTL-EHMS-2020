@@ -1,0 +1,232 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.svm import SVC
+from sklearn.ensemble import VotingClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, confusion_matrix, roc_curve, auc, roc_auc_score
+)
+from xgboost import XGBClassifier
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+
+class MyFinalModel:
+    def __init__(self):
+        self.xgb_mod = XGBClassifier(
+            n_estimators=1000,
+            max_depth=10,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=42,
+            eval_metric='logloss',
+            use_label_encoder=False
+        )
+
+        self.svm1 = SVC(
+            kernel='rbf',
+            C=1000,
+            gamma='scale',
+            probability=True,
+            random_state=42
+        )
+
+        self.svm2 = SVC(
+            kernel='poly',
+            degree=3,
+            C=1000,
+            gamma='scale',
+            probability=True,
+            random_state=42
+        )
+
+        self.all_models = VotingClassifier(
+            estimators=[
+                ('xgb', self.xgb_mod),
+                ('svm_rbf', self.svm1),
+                ('svm_poly', self.svm2)
+            ],
+            voting='soft',
+            weights=[3, 1, 1],
+            n_jobs=-1
+        )
+
+        self.scaler_obj = StandardScaler()
+        self.encoders_used = {}
+        self.feat_list = None
+
+    def do_data_stuff(self, df):
+        df2 = df.copy()
+        df2 = df2.fillna(0)
+
+        drop_cols = [
+            'Attack Category', 'Label', 'SrcMac', 'DstMac',
+            'SrcAddr', 'DstAddr', 'Dir', 'Flgs'
+        ]
+        drop_cols = [c for c in drop_cols if c in df2.columns]
+
+        if 'Label' not in df2.columns:
+            raise ValueError("Label column missing")
+
+        y_vals = df2['Label'].values
+        X_vals = df2.drop(columns=drop_cols)
+
+        self.feat_list = X_vals.columns.tolist()
+
+        cat_cols = X_vals.select_dtypes(include=['object']).columns
+        for c in cat_cols:
+            if c not in self.encoders_used:
+                self.encoders_used[c] = LabelEncoder()
+                X_vals[c] = self.encoders_used[c].fit_transform(X_vals[c].astype(str))
+            else:
+                X_vals[c] = self.encoders_used[c].transform(X_vals[c].astype(str))
+
+        return X_vals.values, y_vals
+
+    def train_everything(self, X_tr, y_tr):
+        X_tr_sc = self.scaler_obj.fit_transform(X_tr)
+
+        self.xgb_mod.fit(X_tr_sc, y_tr)
+        self.svm1.fit(X_tr_sc, y_tr)
+        self.svm2.fit(X_tr_sc, y_tr)
+        self.all_models.fit(X_tr_sc, y_tr)
+
+    def check_model(self, X_te, y_te, mdl):
+        X_te_sc = self.scaler_obj.transform(X_te)
+
+        preds = mdl.predict(X_te_sc)
+        probs = mdl.predict_proba(X_te_sc)[:, 1]
+
+        out = {
+            'Accuracy': accuracy_score(y_te, preds) * 100,
+            'Precision': precision_score(y_te, preds, average='weighted') * 100,
+            'Recall': recall_score(y_te, preds, average='weighted') * 100,
+            'F1-Score': f1_score(y_te, preds, average='weighted') * 100,
+            'AUC-ROC': roc_auc_score(y_te, probs) * 100,
+            'preds': preds,
+            'probs': probs
+        }
+        return out
+
+    def get_imp_feats(self, top_k=20):
+        imps = self.xgb_mod.feature_importances_
+
+        df_imp = pd.DataFrame({
+            'Feature': self.feat_list,
+            'Importance': imps
+        }).sort_values('Importance', ascending=False)
+
+        return df_imp.head(top_k)
+
+
+def make_all_graphs(my_model, X_te, y_te, results_dict, out_dir='C:/Users/bbb/Downloads'):
+    if not os.path.exists(out_dir):
+        print(f"Directory {out_dir} does not exist. Saving to current directory instead.")
+        out_dir = '.'
+
+    ensemble_key = 'Ensemble (Soft Voting)'
+    
+    if ensemble_key in results_dict:
+        pr = results_dict[ensemble_key]['preds']
+        
+        plt.figure(figsize=(6, 5))
+        cm = confusion_matrix(y_te, pr)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title(f'Confusion Matrix: {ensemble_key}')
+        plt.ylabel('Actual')
+        plt.xlabel('Predicted')
+        plt.tight_layout()
+        
+        plt.savefig(f'{out_dir}/conf_matrix_ensemble.png', dpi=300)
+        plt.close()
+        print(f"Saved {ensemble_key} confusion matrix.")
+    else:
+        print(f"Warning: {ensemble_key} not found in results.")
+
+    plt.figure(figsize=(10, 8))
+    for nm, mt in results_dict.items():
+        fpr, tpr, _ = roc_curve(y_te, mt['probs'])
+        plt.plot(fpr, tpr, label=f"{nm} (AUC={auc(fpr, tpr):.3f})")
+
+    plt.plot([0, 1], [0, 1], 'k--', label='Random Chance')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curves - All Models')
+    plt.legend(loc='lower right')
+    plt.savefig(f'{out_dir}/roc_all.png', dpi=300)
+    plt.close()
+    print("Saved ROC curves.")
+
+    imp_df = my_model.get_imp_feats()
+    plt.figure(figsize=(10, 8))
+    plt.barh(imp_df['Feature'], imp_df['Importance'])
+    plt.gca().invert_yaxis()
+    plt.xlabel('Importance')
+    plt.title('Top 20 Features (XGBoost)')
+    plt.tight_layout()
+    plt.savefig(f'{out_dir}/feat_imp.png', dpi=300)
+    plt.close()
+    print("Saved Feature Importance plot.")
+
+
+def main():
+    print("\n========== LOADING DATA ==========")
+    file_path = r'C:/Users/bbb/Downloads/wustl-ehms-2020_with_attacks_categories.csv'
+    
+    if not os.path.exists(file_path):
+        print(f"Error: File not found at {file_path}")
+        return
+
+    df = pd.read_csv(file_path)
+
+    my_model = MyFinalModel()
+
+    print("========== PREPROCESSING ==========")
+    X_all, y_all = my_model.do_data_stuff(df)
+
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_all, y_all, test_size=0.2, random_state=42, stratify=y_all
+    )
+
+    print("========== TRAINING MODELS ==========")
+    my_model.train_everything(X_tr, y_tr)
+
+    print("========== EVALUATING MODELS ==========")
+    results_dict = {}
+
+    model_list = [
+        ('SVM (RBF)', my_model.svm1),
+        ('SVM (Polynomial)', my_model.svm2),
+        ('XGBoost', my_model.xgb_mod),
+        ('Ensemble (Soft Voting)', my_model.all_models)
+    ]
+
+    for nm, md in model_list:
+        results_dict[nm] = my_model.check_model(X_te, y_te, md)
+
+    print("\n============================================================")
+    print("PERFORMANCE METRICS (TEST SET)")
+    print("============================================================")
+
+    for nm, vals in results_dict.items():
+        print(f"\nModel: {nm}")
+        print(f"Accuracy  : {vals['Accuracy']:.2f}%")
+        print(f"Precision : {vals['Precision']:.2f}%")
+        print(f"Recall    : {vals['Recall']:.2f}%")
+        print(f"F1-Score  : {vals['F1-Score']:.2f}%")
+
+    print("\n============================================================")
+
+    make_all_graphs(my_model, X_te, y_te, results_dict, out_dir='C:/Users/bbb/Downloads')
+
+    return my_model, results_dict
+
+
+if __name__ == "__main__":
+    main()
