@@ -199,10 +199,7 @@ best_xgb = rs.best_estimator_
 print("Best XGB params:", rs.best_params_)
 print("Best CV AUC:", rs.best_score_)
 
-# ============================================================
-# 2) Calibrated SVM (probabilities become meaningful → helps ensemble AUC)
-# ============================================================
-# train SVM on a subsample for speed
+
 SVM_SAMPLES = min(80000, len(X_tr_sub))
 X_svm, _, y_svm, _ = train_test_split(X_tr_sub, y_tr_sub, train_size=SVM_SAMPLES, stratify=y_tr_sub, random_state=42)
 
@@ -216,9 +213,7 @@ svm_cal = CalibratedClassifierCV(svm_base, method="sigmoid", cv=3)
 print("\nTraining calibrated SVM...")
 svm_cal.fit(X_svm, y_svm)
 
-# ============================================================
-# 3) Validate: tune ensemble weight + threshold finely
-# ============================================================
+
 px = best_xgb.predict_proba(X_val)[:, 1]
 ps = svm_cal.predict_proba(X_val)[:, 1]
 
@@ -239,9 +234,7 @@ print("\nBest VAL ensemble (wx, thr):", best_cfg, "VAL Accuracy:", best_acc)
 f1s, thr_f1 = best_threshold(y_val, (best_cfg[0]*px + (1-best_cfg[0])*ps), metric="f1")
 print("Best VAL F1 threshold:", thr_f1, "VAL F1:", f1s)
 
-# ============================================================
-# 4) Final fit on full train, then test evaluation
-# ============================================================
+
 spw_full = scale_pos_weight(y_tr)
 
 xgb_final = Pipeline([
@@ -257,7 +250,7 @@ xgb_final = Pipeline([
     ))
 ])
 
-# safer: reuse best params explicitly
+
 best_params = rs.best_params_
 xgb_final = Pipeline([
     ("prep", make_preprocessor(X_tr)),
